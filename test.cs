@@ -1,144 +1,64 @@
 
 using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace EfQueryAnalyzer.Generation;
 
-public static class QueryParameterRewriter
+public static class QueryParameterGenerator
 {
-    public static QueryParameterGenerationResult Rewrite(
-        InvocationExpressionSyntax query,
-        SemanticModel model)
+    public static string? Generate(
+        ITypeSymbol type,
+        string parameterName)
     {
-        var replacements =
-            new Dictionary<ExpressionSyntax, ExpressionSyntax>();
+        if (!IsSupportedType(type))
+            return null;
 
-        var declarations = new List<string>();
-        var parameterIndex = 0;
+        var typeName = type.ToDisplayString(
+            SymbolDisplayFormat.FullyQualifiedFormat);
 
-        // Identify parameters declared inside query lambdas.
-        var lambdaParameters = query
-            .DescendantNodes()
-            .OfType<LambdaExpressionSyntax>()
-            .SelectMany(lambda => lambda switch
-            {
-                SimpleLambdaExpressionSyntax simple =>
-                    [simple.Parameter],
-
-                ParenthesizedLambdaExpressionSyntax parenthesized =>
-                    parenthesized.ParameterList.Parameters,
-
-                _ => Enumerable.Empty<ParameterSyntax>()
-            })
-            .Select(parameter => model.GetDeclaredSymbol(parameter))
-            .OfType<IParameterSymbol>()
-            .Cast<ISymbol>()
-            .ToHashSet(SymbolEqualityComparer.Default);
-
-        // Find the outermost external expressions.
-        var candidates = query
-            .DescendantNodes()
-            .OfType<ExpressionSyntax>()
-            .Where(expression =>
-                expression is IdentifierNameSyntax or
-                    MemberAccessExpressionSyntax)
-            .Where(expression =>
-                IsExternalExpression(
-                    expression,
-                    query,
-                    model,
-                    lambdaParameters))
-            .Where(expression =>
-                !expression.Ancestors()
-                    .OfType<ExpressionSyntax>()
-                    .Any(parent =>
-                        IsExternalExpression(
-                            parent,
-                            query,
-                            model,
-                            lambdaParameters)))
-            .ToList();
-
-        foreach (var expression in candidates)
-        {
-            var type = model.GetTypeInfo(expression).Type;
-
-            if (type is null)
-                continue;
-
-            var parameterName =
-                $"parameter_{parameterIndex + 1}";
-
-            var declaration = QueryParameterGenerator.Generate(
-                type,
-                parameterName);
-
-            if (declaration is null)
-                continue;
-
-            parameterIndex++;
-
-            declarations.Add(declaration);
-
-            replacements[expression] =
-                SyntaxFactory.IdentifierName(parameterName)
-                    .WithTriviaFrom(expression);
-        }
-
-        var rewritten = query.ReplaceNodes(
-            replacements.Keys,
-            (original, _) => replacements[original]);
-
-        return new QueryParameterGenerationResult(
-            rewritten,
-            declarations,
-            true,
-            null);
+        return $"{typeName} {parameterName} = default;";
     }
 
-    private static bool IsExternalExpression(
-        ExpressionSyntax expression,
-        InvocationExpressionSyntax query,
-        SemanticModel model,
-        HashSet<ISymbol> lambdaParameters)
+    private static bool IsSupportedType(ITypeSymbol type)
     {
-        if (expression is not IdentifierNameSyntax &&
-            expression is not MemberAccessExpressionSyntax)
+        // Nullable<T>
+        if (type is INamedTypeSymbol named &&
+            named.OriginalDefinition.SpecialType ==
+                SpecialType.System_Nullable_T)
         {
-            return false;
+            return IsSupportedType(named.TypeArguments[0]);
         }
 
-        // Walk to the root of the property chain.
-        var root = expression;
+        // Enums
+        if (type.TypeKind == TypeKind.Enum)
+            return true;
 
-        while (root is MemberAccessExpressionSyntax member)
-            root = member.Expression;
-
-        if (root is not IdentifierNameSyntax identifier)
-            return false;
-
-        var symbol = model.GetSymbolInfo(identifier).Symbol;
-
-        if (symbol is not ILocalSymbol &&
-            symbol is not IParameterSymbol)
+        // Primitive types
+        if (type.SpecialType is
+            SpecialType.System_String or
+            SpecialType.System_Boolean or
+            SpecialType.System_Byte or
+            SpecialType.System_SByte or
+            SpecialType.System_Int16 or
+            SpecialType.System_UInt16 or
+            SpecialType.System_Int32 or
+            SpecialType.System_UInt32 or
+            SpecialType.System_Int64 or
+            SpecialType.System_UInt64 or
+            SpecialType.System_Single or
+            SpecialType.System_Double or
+            SpecialType.System_Decimal or
+            SpecialType.System_Char)
         {
-            return false;
+            return true;
         }
 
-        // Preserve entity lambda parameters.
-        if (lambdaParameters.Contains(symbol))
-            return false;
-
-        // Preserve variables declared within the query.
-        if (symbol.Locations.Any(location =>
-            location.IsInSource &&
-            location.SourceTree == query.SyntaxTree &&
-            query.Span.Contains(location.SourceSpan)))
-        {
-            return false;
-        }
-
-        return true;
+        // Common .NET value types
+        return type.ToDisplayString() is
+            "System.Guid" or
+            "System.DateTime" or
+            "System.DateTimeOffset" or
+            "System.DateOnly" or
+            "System.TimeOnly" or
+            "System.TimeSpan";
     }
 }

@@ -1,79 +1,47 @@
-
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-
-namespace EfQueryAnalyzer.Generation;
-
-public sealed class QueryProjectionRewriter : CSharpSyntaxRewriter
+private static string GetSampleValue(ITypeSymbol type)
 {
-    public override SyntaxNode? VisitInvocationExpression(
-        InvocationExpressionSyntax node)
+    if (type is INamedTypeSymbol named &&
+        named.OriginalDefinition.SpecialType ==
+            SpecialType.System_Nullable_T)
     {
-        // Only rewrite projections inside Select().
-        if (node.Expression is not MemberAccessExpressionSyntax member ||
-            member.Name.Identifier.ValueText != "Select")
-        {
-            return base.VisitInvocationExpression(node);
-        }
-
-        if (node.ArgumentList.Arguments.Count != 1)
-            return base.VisitInvocationExpression(node);
-
-        var argument = node.ArgumentList.Arguments[0];
-
-        if (argument.Expression is not LambdaExpressionSyntax lambda)
-            return base.VisitInvocationExpression(node);
-
-        if (lambda.Body is not ObjectCreationExpressionSyntax creation)
-            return base.VisitInvocationExpression(node);
-
-        if (creation.Initializer is null ||
-            creation.Initializer.Kind() != SyntaxKind.ObjectInitializerExpression ||
-            creation.ArgumentList?.Arguments.Count > 0)
-        {
-            return base.VisitInvocationExpression(node);
-        }
-
-        // Only support simple property assignments.
-        var assignments = creation.Initializer.Expressions
-            .OfType<AssignmentExpressionSyntax>()
-            .ToArray();
-
-        if (assignments.Length != creation.Initializer.Expressions.Count ||
-            assignments.Any(a =>
-                !a.IsKind(SyntaxKind.SimpleAssignmentExpression) ||
-                a.Left is not IdentifierNameSyntax))
-        {
-            return base.VisitInvocationExpression(node);
-        }
-
-        var members = assignments.Select(assignment =>
-            SyntaxFactory.AnonymousObjectMemberDeclarator(
-                SyntaxFactory.NameEquals(
-                    SyntaxFactory.IdentifierName(
-                        ((IdentifierNameSyntax)assignment.Left).Identifier)),
-                assignment.Right));
-
-        var anonymousCreation =
-            SyntaxFactory.AnonymousObjectCreationExpression(
-                SyntaxFactory.SeparatedList(members))
-            .WithTriviaFrom(creation);
-
-        var rewrittenLambda = lambda.ReplaceNode(
-            creation,
-            anonymousCreation);
-
-        var rewrittenInvocation = node.ReplaceNode(
-            lambda,
-            rewrittenLambda);
-
-        return base.VisitInvocationExpression(rewrittenInvocation);
+        return GetSampleValue(named.TypeArguments[0]);
     }
 
-    public static ExpressionSyntax Rewrite(ExpressionSyntax expression)
+    if (type.TypeKind == TypeKind.Enum)
+        return $"default({type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)})";
+
+    return type.SpecialType switch
     {
-        return (ExpressionSyntax)new QueryProjectionRewriter()
-            .Visit(expression)!;
-    }
+        SpecialType.System_String => "\"sample\"",
+        SpecialType.System_Boolean => "true",
+        SpecialType.System_Char => "'A'",
+
+        SpecialType.System_Byte or
+        SpecialType.System_SByte or
+        SpecialType.System_Int16 or
+        SpecialType.System_UInt16 or
+        SpecialType.System_Int32 or
+        SpecialType.System_UInt32 or
+        SpecialType.System_Int64 or
+        SpecialType.System_UInt64 or
+        SpecialType.System_Single or
+        SpecialType.System_Double or
+        SpecialType.System_Decimal => "1",
+
+        _ => type.ToDisplayString() switch
+        {
+            "System.Guid" => "global::System.Guid.Empty",
+            "System.DateTime" =>
+                "new global::System.DateTime(2020, 1, 1)",
+            "System.DateTimeOffset" =>
+                "new global::System.DateTimeOffset(2020, 1, 1, 0, 0, 0, global::System.TimeSpan.Zero)",
+            "System.DateOnly" =>
+                "new global::System.DateOnly(2020, 1, 1)",
+            "System.TimeOnly" =>
+                "new global::System.TimeOnly(12, 0)",
+            "System.TimeSpan" =>
+                "global::System.TimeSpan.FromMinutes(1)",
+            _ => "default"
+        }
+    };
 }

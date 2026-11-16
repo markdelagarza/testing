@@ -1,175 +1,199 @@
 
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace EfQueryAnalyzer.Generation;
 
-public static class QueryParameterGenerator
+public static class QueryParameterRewriter
 {
-    public static string? Generate(
-        ITypeSymbol type,
-        string parameterName)
+    public static QueryParameterGenerationResult Rewrite(
+        InvocationExpressionSyntax query,
+        SemanticModel model)
     {
-        // Arrays
-        if (type is IArrayTypeSymbol array &&
-            array.Rank == 1 &&
-            IsSupportedType(array.ElementType))
-        {
-            var elementType = GetTypeName(array.ElementType);
-            var sampleValue = GetSampleValue(array.ElementType);
+        var replacements =
+            new Dictionary<ExpressionSyntax, ExpressionSyntax>();
 
-            return $"{elementType}[] {parameterName} = [{sampleValue}];";
-        }
+        var declarations = new List<string>();
+        var parameterIndex = 0;
 
-        // Generic collections
-        if (type is INamedTypeSymbol named &&
-            named.IsGenericType &&
-            named.TypeArguments.Length == 1 &&
-            IsSupportedType(named.TypeArguments[0]) &&
-            IsSupportedCollection(named))
-        {
-            var typeName = GetTypeName(type);
-            var sampleValue = GetSampleValue(named.TypeArguments[0]);
-
-            return $"{typeName} {parameterName} = [{sampleValue}];";
-        }
-
-        // Scalar values
-        if (!IsSupportedType(type))
-            return null;
-
-        var scalarType = GetTypeName(type);
-
-        return $"{scalarType} {parameterName} = default;";
-    }
-
-    private static bool IsSupportedCollection(
-        INamedTypeSymbol type)
-    {
-        var definition = type.OriginalDefinition
-            .ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-
-        return definition is
-            "global::System.Collections.Generic.List<T>" or
-            "global::System.Collections.Generic.IEnumerable<T>" or
-            "global::System.Collections.Generic.ICollection<T>" or
-            "global::System.Collections.Generic.IReadOnlyCollection<T>" or
-            "global::System.Collections.Generic.IReadOnlyList<T>" or
-            "global::System.Collections.Generic.IList<T>" or
-            "global::System.Collections.Generic.ISet<T>" or
-            "global::System.Collections.Generic.HashSet<T>";
-    }
-
-    private static bool IsSupportedType(ITypeSymbol type)
-    {
-        // Nullable<T>
-        if (type is INamedTypeSymbol named &&
-            named.OriginalDefinition.SpecialType ==
-                SpecialType.System_Nullable_T)
-        {
-            return IsSupportedType(named.TypeArguments[0]);
-        }
-
-        // Enums
-        if (type.TypeKind == TypeKind.Enum)
-            return true;
-
-        // Primitive types
-        if (type.SpecialType is
-            SpecialType.System_String or
-            SpecialType.System_Boolean or
-            SpecialType.System_Byte or
-            SpecialType.System_SByte or
-            SpecialType.System_Int16 or
-            SpecialType.System_UInt16 or
-            SpecialType.System_Int32 or
-            SpecialType.System_UInt32 or
-            SpecialType.System_Int64 or
-            SpecialType.System_UInt64 or
-            SpecialType.System_Single or
-            SpecialType.System_Double or
-            SpecialType.System_Decimal or
-            SpecialType.System_Char)
-        {
-            return true;
-        }
-
-        // Common .NET value types
-        return type.ToDisplayString() is
-            "System.Guid" or
-            "System.DateTime" or
-            "System.DateTimeOffset" or
-            "System.DateOnly" or
-            "System.TimeOnly" or
-            "System.TimeSpan";
-    }
-
-    private static string GetTypeName(ITypeSymbol type)
-    {
-        return type.ToDisplayString(
-            SymbolDisplayFormat.FullyQualifiedFormat);
-    }
-
-    private static string GetSampleValue(ITypeSymbol type)
-    {
-        // Nullable<T>
-        if (type is INamedTypeSymbol named &&
-            named.OriginalDefinition.SpecialType ==
-                SpecialType.System_Nullable_T)
-        {
-            return GetSampleValue(named.TypeArguments[0]);
-        }
-
-        // Enums
-        if (type.TypeKind == TypeKind.Enum)
-        {
-            return $"default({GetTypeName(type)})";
-        }
-
-        return type.SpecialType switch
-        {
-            SpecialType.System_String => "\"sample\"",
-            SpecialType.System_Boolean => "true",
-            SpecialType.System_Char => "'A'",
-
-            SpecialType.System_Byte or
-            SpecialType.System_SByte or
-            SpecialType.System_Int16 or
-            SpecialType.System_UInt16 or
-            SpecialType.System_Int32 or
-            SpecialType.System_UInt32 or
-            SpecialType.System_Int64 or
-            SpecialType.System_UInt64 or
-            SpecialType.System_Single or
-            SpecialType.System_Double or
-            SpecialType.System_Decimal => "1",
-
-            SpecialType.System_Single => "1f",
-            SpecialType.System_Double => "1d",
-
-            _ => type.ToDisplayString() switch
+        // Identify parameters declared inside query lambdas.
+        var lambdaParameters = query
+            .DescendantNodes()
+            .OfType<LambdaExpressionSyntax>()
+            .SelectMany(lambda => lambda switch
             {
-                "System.Guid" =>
-                    "global::System.Guid.Empty",
+                SimpleLambdaExpressionSyntax simple =>
+                    [simple.Parameter],
 
-                "System.DateTime" =>
-                    "new global::System.DateTime(2020, 1, 1)",
+                ParenthesizedLambdaExpressionSyntax parenthesized =>
+                    parenthesized.ParameterList.Parameters,
 
-                "System.DateTimeOffset" =>
-                    "new global::System.DateTimeOffset(" +
-                    "2020, 1, 1, 0, 0, 0, " +
-                    "global::System.TimeSpan.Zero)",
+                _ => Enumerable.Empty<ParameterSyntax>()
+            })
+            .Select(parameter => model.GetDeclaredSymbol(parameter))
+            .OfType<IParameterSymbol>()
+            .Cast<ISymbol>()
+            .ToHashSet(SymbolEqualityComparer.Default);
 
-                "System.DateOnly" =>
-                    "new global::System.DateOnly(2020, 1, 1)",
+        // Identify external expressions.
+        var candidates = query
+            .DescendantNodes()
+            .OfType<ExpressionSyntax>()
+            .Where(expression =>
+                expression is IdentifierNameSyntax or
+                    MemberAccessExpressionSyntax)
+            .Where(expression =>
+                IsExternalExpression(
+                    expression,
+                    query,
+                    model,
+                    lambdaParameters))
+            .Where(expression =>
+                !expression.Ancestors()
+                    .OfType<ExpressionSyntax>()
+                    .Any(parent =>
+                        IsExternalExpression(
+                            parent,
+                            query,
+                            model,
+                            lambdaParameters)))
+            .ToList();
 
-                "System.TimeOnly" =>
-                    "new global::System.TimeOnly(12, 0)",
+        foreach (var expression in candidates)
+        {
+            var type = model.GetTypeInfo(expression).Type;
 
-                "System.TimeSpan" =>
-                    "global::System.TimeSpan.FromMinutes(1)",
+            if (type is null)
+                continue;
 
-                _ => "default"
+            var parameterName =
+                $"parameter_{parameterIndex + 1}";
+
+            var declaration = QueryParameterGenerator.Generate(
+                type,
+                parameterName);
+
+            if (declaration is null)
+                continue;
+
+            parameterIndex++;
+
+            declarations.Add(declaration);
+
+            replacements[expression] =
+                SyntaxFactory.IdentifierName(parameterName)
+                    .WithTriviaFrom(expression);
+        }
+
+        var rewritten = query.ReplaceNodes(
+            replacements.Keys,
+            (original, _) => replacements[original]);
+
+        return new QueryParameterGenerationResult(
+            rewritten,
+            declarations,
+            true,
+            null);
+    }
+
+    private static bool IsExternalExpression(
+        ExpressionSyntax expression,
+        InvocationExpressionSyntax query,
+        SemanticModel model,
+        HashSet<ISymbol> lambdaParameters)
+    {
+        if (expression is not IdentifierNameSyntax &&
+            expression is not MemberAccessExpressionSyntax)
+        {
+            return false;
+        }
+
+        // Preserve method names in calls such as:
+        // numbers.Contains(o.Item)
+        //
+        // We want to replace "numbers", not "numbers.Contains".
+        if (expression is MemberAccessExpressionSyntax methodAccess &&
+            methodAccess.Parent is InvocationExpressionSyntax invocation &&
+            invocation.Expression == methodAccess)
+        {
+            return false;
+        }
+
+        // Handle constants:
+        // Truck
+        // Shop.Truck
+        // Constants.Shop.Truck
+        var expressionSymbol =
+            model.GetSymbolInfo(expression).Symbol;
+
+        if (expressionSymbol is IFieldSymbol { IsConst: true })
+            return true;
+
+        // Walk to the root of the property chain.
+        // Handle null-forgiving operators and parentheses.
+        ExpressionSyntax root = expression;
+
+        while (true)
+        {
+            switch (root)
+            {
+                case MemberAccessExpressionSyntax member:
+                    root = member.Expression;
+                    break;
+
+                case PostfixUnaryExpressionSyntax postfix
+                    when postfix.IsKind(
+                        SyntaxKind.SuppressNullableWarningExpression):
+                    root = postfix.Operand;
+                    break;
+
+                case ParenthesizedExpressionSyntax parenthesized:
+                    root = parenthesized.Expression;
+                    break;
+
+                default:
+                    goto RootFound;
             }
-        };
+        }
+
+    RootFound:
+
+        // Handle expressions such as this._service.Id.
+        if (root is ThisExpressionSyntax)
+        {
+            var type = model.GetTypeInfo(expression).Type;
+
+            return type is not null &&
+                QueryParameterGenerator.Generate(
+                    type,
+                    "parameter") is not null;
+        }
+
+        if (root is not IdentifierNameSyntax identifier)
+            return false;
+
+        var symbol = model.GetSymbolInfo(identifier).Symbol;
+
+        if (symbol is not ILocalSymbol &&
+            symbol is not IParameterSymbol)
+        {
+            return false;
+        }
+
+        // Preserve entity lambda parameters.
+        if (lambdaParameters.Contains(symbol))
+            return false;
+
+        // Preserve variables declared within the query.
+        if (symbol.Locations.Any(location =>
+            location.IsInSource &&
+            location.SourceTree == query.SyntaxTree &&
+            query.Span.Contains(location.SourceSpan)))
+        {
+            return false;
+        }
+
+        return true;
     }
 }
